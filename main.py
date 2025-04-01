@@ -2,11 +2,15 @@ import sys
 import re
 import requests
 import webbrowser
+import zipfile
+import os
+import tempfile
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QPushButton, QLabel, QTableWidget,
                              QTableWidgetItem, QMessageBox, QFileDialog, QAction, QLabel)
 from PyQt5.QtCore import Qt, QSettings, QTimer
+from PyQt5 import QtWidgets, QtGui
 from datetime import datetime
-from packaging import version
+from packaging.version import parse as parse_version
 from toast_notification import ToastNotification
 from get_local_mods import get_mods_versions, get_mod_folder_from_settings
 
@@ -16,7 +20,7 @@ class ModViewer(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ModWerkstatt Mod Loader")
-        self.setGeometry(100, 100, 800, 600)
+        self.setGeometry(100, 100, 900, 600)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -90,17 +94,16 @@ class ModViewer(QMainWindow):
         except KeyError as e:
             QMessageBox.critical(self, "Fehler", f"Datenfeld fehlt in JSON:\n{e}")
 
-
     def get_combined_mod_list(self, mods_json, mods_local):
         combined = []
 
-        ## Lokale Daten schnell nutzbar als Dictionary vorbereiten
+        # Lokale Daten vorbereiten
         local_dict = {}
         for mod_loc in mods_local:
             foldername, major_version = split_foldername_version(mod_loc["modOrdner"])
             local_dict[foldername] = mod_loc["version"]  # z.B. version = "1.2"
 
-        ## JSON durchlaufen und vergleichen!
+        # JSON-Daten durchlaufen und vergleichen!
         for mod_entry in mods_json:
             remote_version = mod_entry.get("version", "N/A")
             mod_name = mod_entry.get("name", "N/A")
@@ -113,24 +116,25 @@ class ModViewer(QMainWindow):
                 continue
 
             if foldername_json in local_dict:
-                # Ein Match wurde gefunden.
                 local_version = local_dict[foldername_json]
 
-                combined.append({
-                    "name": mod_name,
-                    "remote_version": remote_version,
-                    "local_version": local_version,
-                    "created": mod_entry.get("timecreated", 0),
-                    "changed": mod_entry.get("timechanged", 0),
-                })
+                # statt manuellem Neubau hier den original JSON-Eintrag kopieren
+                # und wichtige lokale Versionsinfo ergänzen
+                mod_copy = mod_entry.copy()  # Erstelle Kopie des JSON-Mod-Entrys
+                mod_copy["local_version"] = local_version
+                mod_copy["remote_version"] = remote_version
+                mod_copy["created"] = mod_entry.get("timecreated", 0)
+                mod_copy["changed"] = mod_entry.get("timechanged", 0)
+
+                combined.append(mod_copy)  # Diese Kopie enthält nun definitiv das "files"-Feld!
 
         return combined
 
     def populate_mod_table(self, combined_mods):
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(combined_mods))
-        self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(["Name", "Lokale Version", "Remote Version", "Erstellt am", "Zuletzt geändert"])
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["Name", "Lokale Version", "Neueste Version", "Veröffentlicht", "Geändert", "Aktion"])
 
         for row_index, mod in enumerate(combined_mods):
             created_date = datetime.fromtimestamp(mod["created"]).strftime('%Y-%m-%d %H:%M:%S') if mod["created"] else 'N/A'
@@ -146,6 +150,7 @@ class ModViewer(QMainWindow):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setSortingEnabled(True)
         self.table.sortItems(0, Qt.AscendingOrder)
+        self.highlight_update_rows(combined_mods)
 
     def select_mod_folder(self):
         # Bisher gespeicherten Pfad laden und anzeigen
@@ -179,11 +184,11 @@ class ModViewer(QMainWindow):
             QMessageBox.warning(self, "Keine Einstellungen", "Bitte zuerst einen Mod-Ordner auswählen (Einstellungen ➜ Mod-Ordner auswählen)")
             return
 
-        mods_list = get_mods_versions(mod_folder)
+            mods_list = get_mods_versions(mod_folder)
 
-        print("Aktuelle lokale Mods:")
-        for mod_info in mods_list:
-            print(mod_info["modOrdner"], mod_info["version"])
+        # print("Aktuelle lokale Mods:")
+        # for mod_info in mods_list:
+        #     print(mod_info["modOrdner"], mod_info["version"])
 
     def notify_if_update_available(self):
         is_update, latest_version, download_url = check_for_update(APP_VERSION)
@@ -200,6 +205,130 @@ class ModViewer(QMainWindow):
             if user_choice == QMessageBox.Yes:
                 # Nutzer zu GitHub Release Seite senden
                 webbrowser.open(download_url)
+
+    def highlight_update_rows(self, mods):
+        row_count = self.table.rowCount()
+
+        for row in range(row_count):
+            local_item = self.table.item(row, 1)  # Lokale Versionsspalte
+            remote_item = self.table.item(row, 2)  # Remote Versionsspalte
+
+            if local_item and remote_item:
+                local_version_text = local_item.text().strip()
+                remote_version_text = remote_item.text().strip()
+
+                if not remote_version_text:
+                    remote_version_text = "0.0"
+
+                try:
+                    local_version = parse_version(local_version_text)
+                    remote_version = parse_version(remote_version_text)
+                except Exception as e:
+                    print(f"⚠️ Fehler beim Parsen Version '{local_version_text}'/'{remote_version_text}': {e}")
+                    continue
+
+                if remote_version > local_version:
+                    # echtes Update vorhanden
+                    update_button = QPushButton("⬆️ Update")
+                    update_button.clicked.connect(lambda checked, row=row: self.handle_update(row))
+                    self.table.setCellWidget(row, 5, update_button)
+                    sort_item = QTableWidgetItem("1")
+                    sort_item.setData(Qt.UserRole, 1)  # Für besseres Sortieren
+                    sort_item.setTextAlignment(Qt.AlignCenter)
+                    sort_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                    self.table.setItem(row, 5, sort_item)
+                else:
+                    # kein Update nötig, ggf. Knopf entfernen oder Zeile löschen
+                    self.table.setCellWidget(row, 5, None)
+
+                    sort_item = QTableWidgetItem("")
+                    sort_item.setData(Qt.UserRole, 0)
+                    sort_item.setTextAlignment(Qt.AlignCenter)
+                    sort_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                    self.table.setItem(row, 5, sort_item)
+
+    def update_mod(self, filename):
+        # Dynamisch Mods-Ordner aus Einstellungen laden:
+        mods_ordner = get_mod_folder_from_settings()
+
+        # Prüfen, ob Mods-Ordner gesetzt wurde:
+        if not mods_ordner or not os.path.isdir(mods_ordner):
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "⚠️ Fehler", "Bitte lege zuerst einen Mods-Ordner in den Einstellungen fest.")
+            return False
+
+        download_url = f"https://modwerkstatt.com/download/{filename}"
+
+        print(f"⬇️ Lade Datei herunter: {download_url}")
+
+        # Temporäre Datei anlegen und Download starten
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                local_zip_path = os.path.join(temp_dir, f"{filename}.zip")
+
+                with requests.get(download_url, stream=True) as response:
+                    response.raise_for_status()
+                    with open(local_zip_path, "wb") as zip_file:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                zip_file.write(chunk)
+
+                print(f"📦 Datei heruntergeladen -> {local_zip_path}")
+
+                # Ziel-Ordner vorbereiten:
+                zielordner = os.path.join(mods_ordner, filename)
+
+                # Alten Ordner löschen falls nötig (ACHTUNG: dauerhaftes Löschen!)
+                if os.path.exists(zielordner):
+                    import shutil
+                    print(f"⚠️ Lösche alten Mod-Ordner {zielordner}...")
+                    shutil.rmtree(zielordner)
+
+                os.makedirs(zielordner, exist_ok=True)
+
+                # ZIP-Inhalt in Ordner entpacken:
+                with zipfile.ZipFile(local_zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(zielordner)
+
+                print(f"✅ Mod '{filename}' erfolgreich im Ordner '{zielordner}' installiert.")
+
+            return True
+
+        except Exception as e:
+            print(f"⚠️ Fehler beim Update '{filename}': {e}")
+            return False
+
+    def handle_update(self, row):
+        display_name = self.table.item(row, 0).text()
+        zip_filename = self.table.item(row, 3).text().strip()  # 🔴 Hier anpassen auf richtige Spalte!
+
+        # Filename OHNE .zip um Ordnerstruktur sauber zu halten:
+        filename_without_zip = zip_filename.replace('.zip', '')
+
+        print(f"🔄 Starte Update für Mod: {display_name} ➡️ Dateiname: {zip_filename}")
+
+        success = self.update_mod(zip_filename, filename_without_zip)
+        if success:
+            print(f"🎉 Update abgeschlossen für: {display_name}")
+
+            remote_version = self.table.item(row, 2).text().strip()
+            self.table.item(row, 1).setText(remote_version)
+
+            # Update-Button entfernen
+            self.table.setCellWidget(row, 5, None)
+
+            # Sortierung aktualisieren
+            from PyQt5.QtCore import Qt
+            from PyQt5.QtWidgets import QTableWidgetItem
+            sort_item = QTableWidgetItem("0")
+            sort_item.setData(Qt.UserRole, 0)
+            sort_item.setTextAlignment(Qt.AlignCenter)
+            sort_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            self.table.setItem(row, 5, sort_item)
+
+        else:
+            print(f"❌ Update fehlgeschlagen für: {display_name}")
+
 
 def split_foldername_version(folder_fullname):
     # Regex Muster um _Zahlen (Version) hinten abzutrennen
