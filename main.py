@@ -1,10 +1,12 @@
 import sys
 import re
 import requests
+import webbrowser
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QPushButton, QLabel, QTableWidget,
                              QTableWidgetItem, QMessageBox, QFileDialog, QAction, QLabel)
 from PyQt5.QtCore import Qt, QSettings, QTimer
 from datetime import datetime
+from packaging import version
 from toast_notification import ToastNotification
 from get_local_mods import get_mods_versions, get_mod_folder_from_settings
 
@@ -49,6 +51,9 @@ class ModViewer(QMainWindow):
         self.version_label = QLabel(f"Version {APP_VERSION}")
         self.statusBar().addPermanentWidget(self.version_label)
         self.show_mod_folder_in_statusbar()
+
+        # Update available?
+        self.notify_if_update_available()
 
         # Automatisches initiales Laden der JSON-Daten beim Start
         self.load_json()
@@ -180,6 +185,22 @@ class ModViewer(QMainWindow):
         for mod_info in mods_list:
             print(mod_info["modOrdner"], mod_info["version"])
 
+    def notify_if_update_available(self):
+        is_update, latest_version, download_url = check_for_update(APP_VERSION)
+        if is_update:
+            msg = QMessageBox(self)
+            msg.setIcon(QMessageBox.Information)
+            msg.setWindowTitle("🟢 Update verfügbar!")
+            msg.setText(f"Eine neue Version ist verfügbar: {latest_version}\n\n"
+                        f"Aktuelle installierte Version: {APP_VERSION}\n\n"
+                        f"Möchtest du die neue Version herunterladen?")
+            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            user_choice = msg.exec()
+
+            if user_choice == QMessageBox.Yes:
+                # Nutzer zu GitHub Release Seite senden
+                webbrowser.open(download_url)
+
 def split_foldername_version(folder_fullname):
     # Regex Muster um _Zahlen (Version) hinten abzutrennen
     match = re.match(r"(.+?)_(\d+)$", folder_fullname)
@@ -188,6 +209,25 @@ def split_foldername_version(folder_fullname):
         return match.group(1), int(match.group(2))
     else:
         return folder_fullname, None  # kein Match / keine Zahl hinten
+
+def get_latest_github_version():
+    url = "https://api.github.com/repos/ModWerkstatt/modloader/releases/latest"
+    try:
+        response = requests.get(url)
+        response.raise_for_status()  # Fehler werfen, wenn Status nicht 200 ist
+        latest_release = response.json()
+        latest_tag = latest_release["tag_name"]
+        print(f"GitHub aktuellste Release-Version: {latest_tag}")
+        return latest_release["tag_name"], latest_release["html_url"]  # Version & Download-Link
+    except requests.RequestException:
+        return None, None  # bei einem Problem (Netzwerk/Fehler) nichts tun
+
+def check_for_update(current_version):
+    latest_version, latest_url = get_latest_github_version()
+    if latest_version and version.parse(latest_version) > version.parse(current_version):
+        return True, latest_version, latest_url  # neue Version vorhanden
+    return False, latest_version, None  # kein Update verfügbar
+
 
 def main():
     app = QApplication(sys.argv)
