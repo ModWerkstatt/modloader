@@ -2,7 +2,7 @@ import sys
 import re
 import requests
 import webbrowser
-import zipfile
+import shutil
 import os
 import tempfile
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QPushButton, QLabel, QTableWidget,
@@ -131,6 +131,7 @@ class ModViewer(QMainWindow):
         return combined
 
     def populate_mod_table(self, combined_mods):
+
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(combined_mods))
         self.table.setColumnCount(6)
@@ -146,10 +147,23 @@ class ModViewer(QMainWindow):
             self.table.setItem(row_index, 3, QTableWidgetItem(created_date))
             self.table.setItem(row_index, 4, QTableWidgetItem(changed_date))
 
+            update_button = QPushButton("Update")
+            if mod.get("files") and len(mod["files"]) > 0:
+                zip_filename = mod["files"][0].get("filename", "unbekannt.zip")
+            else:
+                zip_filename = "unbekannt.zip"
+
+            update_button.setProperty("zip_filename", zip_filename)
+            update_button.setProperty("display_name", mod["name"])  # Modanzeige zur leichteren Identifizierung
+            update_button.clicked.connect(lambda checked, btn=update_button: self.handle_update(btn))
+
+            self.table.setCellWidget(row_index, 5, update_button)
+
         self.table.resizeColumnsToContents()
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setSortingEnabled(True)
         self.table.sortItems(0, Qt.AscendingOrder)
+
         self.highlight_update_rows(combined_mods)
 
     def select_mod_folder(self):
@@ -229,9 +243,19 @@ class ModViewer(QMainWindow):
 
                 if remote_version > local_version:
                     # echtes Update vorhanden
+                    mod_name = self.table.item(row, 0).text()
+                    matched_mod = next((m for m in mods if m["name"] == mod_name), None)
+
+                    if matched_mod and matched_mod.get("files") and len(matched_mod["files"]) > 0:
+                        zip_filename = matched_mod["files"][0].get("filename", "unbekannt.zip")
+                    else:
+                        zip_filename = "unbekannt.zip"
+
                     update_button = QPushButton("⬆️ Update")
-                    update_button.clicked.connect(lambda checked, row=row: self.handle_update(row))
+                    update_button.setProperty("zip_filename", zip_filename)  # wichtige neue Zeile!
+                    update_button.clicked.connect(lambda checked, btn=update_button: self.handle_update(btn))
                     self.table.setCellWidget(row, 5, update_button)
+
                     sort_item = QTableWidgetItem("1")
                     sort_item.setData(Qt.UserRole, 1)  # Für besseres Sortieren
                     sort_item.setTextAlignment(Qt.AlignCenter)
@@ -247,62 +271,72 @@ class ModViewer(QMainWindow):
                     sort_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
                     self.table.setItem(row, 5, sort_item)
 
-    def update_mod(self, filename):
-        # Dynamisch Mods-Ordner aus Einstellungen laden:
-        mods_ordner = get_mod_folder_from_settings()
+    def update_mod(self, zip_filename, filename_without_zip):
+        print(f"Starte Update für Datei '{zip_filename}' mit interner Bezeichnung '{filename_without_zip}'")
 
-        # Prüfen, ob Mods-Ordner gesetzt wurde:
-        if not mods_ordner or not os.path.isdir(mods_ordner):
-            from PyQt5.QtWidgets import QMessageBox
-            QMessageBox.warning(self, "⚠️ Fehler", "Bitte lege zuerst einen Mods-Ordner in den Einstellungen fest.")
-            return False
-
-        download_url = f"https://modwerkstatt.com/download/{filename}"
-
+        # URL festlegen
+        download_url = f"https://modwerkstatt.com/download/{zip_filename}"
         print(f"⬇️ Lade Datei herunter: {download_url}")
 
-        # Temporäre Datei anlegen und Download starten
+        # Temporärer Download der ZIP-Datei
+        temp_dir = tempfile.mkdtemp()
+        zip_filepath = os.path.join(temp_dir, zip_filename)
+        success = False
+
         try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                local_zip_path = os.path.join(temp_dir, f"{filename}.zip")
+            response = requests.get(download_url)
+            response.raise_for_status()
 
-                with requests.get(download_url, stream=True) as response:
-                    response.raise_for_status()
-                    with open(local_zip_path, "wb") as zip_file:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            if chunk:
-                                zip_file.write(chunk)
+            if not zip_filepath.endswith(".zip"):
+                zip_filepath += ".zip"
 
-                print(f"📦 Datei heruntergeladen -> {local_zip_path}")
+            with open(zip_filepath, 'wb') as file:
+                file.write(response.content)
+            print(f"📦 Datei heruntergeladen -> {zip_filepath}")
 
-                # Ziel-Ordner vorbereiten:
-                zielordner = os.path.join(mods_ordner, filename)
+            # Alten Mod-Ordner sauber löschen
+            mod_folder_path = os.path.join(get_mod_folder_from_settings(), filename_without_zip)
+            if os.path.exists(mod_folder_path):
+                print(f"⚠️ Lösche alten Mod-Ordner {mod_folder_path}...")
+                shutil.rmtree(mod_folder_path)
 
-                # Alten Ordner löschen falls nötig (ACHTUNG: dauerhaftes Löschen!)
-                if os.path.exists(zielordner):
-                    import shutil
-                    print(f"⚠️ Lösche alten Mod-Ordner {zielordner}...")
-                    shutil.rmtree(zielordner)
+            # Neuen Mod entpacken
+            os.makedirs(mod_folder_path, exist_ok=True)
+            temp_unzip_folder = os.path.join(temp_dir, "unpacked_mod")
+            shutil.unpack_archive(zip_filepath, temp_unzip_folder)
 
-                os.makedirs(zielordner, exist_ok=True)
+            # Prüfen, ob zusätzlicher Unterordner vorhanden ist
+            extracted_items = os.listdir(temp_unzip_folder)
 
-                # ZIP-Inhalt in Ordner entpacken:
-                with zipfile.ZipFile(local_zip_path, 'r') as zip_ref:
-                    zip_ref.extractall(zielordner)
+            if len(extracted_items) == 1 and os.path.isdir(os.path.join(temp_unzip_folder, extracted_items[0])):
+                # Zusätzlicher Ordner gefunden – dessen Inhalt nach oben verschieben!
+                inner_folder_path = os.path.join(temp_unzip_folder, extracted_items[0])
+                for item in os.listdir(inner_folder_path):
+                    item_full_path = os.path.join(inner_folder_path, item)
+                    shutil.move(item_full_path, mod_folder_path)
+                print("✅ Zusätzlicher Unterordner erkannt – Inhalt erfolgreich verschoben.")
+            else:
+                # Kein zusätzlicher Ordner – alles normal verschieben
+                for item in extracted_items:
+                    item_full_path = os.path.join(temp_unzip_folder, item)
+                    shutil.move(item_full_path, mod_folder_path)
+                print("✅ Kein zusätzlicher Unterordner gefunden – Inhalt direkt entpackt.")
 
-                print(f"✅ Mod '{filename}' erfolgreich im Ordner '{zielordner}' installiert.")
-
-            return True
+            success = True
+            print(f"✅ Mod erfolgreich aktualisiert nach {mod_folder_path}")
 
         except Exception as e:
-            print(f"⚠️ Fehler beim Update '{filename}': {e}")
-            return False
+            print(f"⚠️ Fehler beim Update '{zip_filename}': {e}")
+            success = False
 
-    def handle_update(self, row):
-        display_name = self.table.item(row, 0).text()
-        zip_filename = self.table.item(row, 3).text().strip()  # 🔴 Hier anpassen auf richtige Spalte!
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
-        # Filename OHNE .zip um Ordnerstruktur sauber zu halten:
+        return success
+
+    def handle_update(self, update_button):
+        zip_filename = update_button.property("zip_filename")
+        display_name = update_button.property("display_name") or "Unbekannter Mod"
         filename_without_zip = zip_filename.replace('.zip', '')
 
         print(f"🔄 Starte Update für Mod: {display_name} ➡️ Dateiname: {zip_filename}")
@@ -311,21 +345,18 @@ class ModViewer(QMainWindow):
         if success:
             print(f"🎉 Update abgeschlossen für: {display_name}")
 
-            remote_version = self.table.item(row, 2).text().strip()
-            self.table.item(row, 1).setText(remote_version)
+            current_row = self.table.indexAt(update_button.pos()).row()
+            remote_version = self.table.item(current_row, 2).text().strip()
+            self.table.item(current_row, 1).setText(remote_version)
 
-            # Update-Button entfernen
-            self.table.setCellWidget(row, 5, None)
+            self.table.setCellWidget(current_row, 5, None)
 
-            # Sortierung aktualisieren
             from PyQt5.QtCore import Qt
-            from PyQt5.QtWidgets import QTableWidgetItem
-            sort_item = QTableWidgetItem("0")
+            sort_item = QTableWidgetItem("")
             sort_item.setData(Qt.UserRole, 0)
             sort_item.setTextAlignment(Qt.AlignCenter)
             sort_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
-            self.table.setItem(row, 5, sort_item)
-
+            self.table.setItem(current_row, 5, sort_item)
         else:
             print(f"❌ Update fehlgeschlagen für: {display_name}")
 
